@@ -1,0 +1,5 @@
+# python
+langchain
+tweepy
+python-dotenv
+langchain_groq
