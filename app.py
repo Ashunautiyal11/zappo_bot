@@ -1,225 +1,252 @@
 import os
-from langchain.prompts import PromptTemplate
 from langchain_groq import ChatGroq
 import tweepy
 from logging import getLogger, basicConfig, INFO
 import re
 import random
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
+import time
+import schedule
 from dotenv import load_dotenv
+from prompts import tweet_prompt
 
+# Load .ENV variable
 load_dotenv()
 
 # Configure logging
-basicConfig(level=INFO)
+basicConfig(
+    level=INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = getLogger(__name__)
 
-#TWITTER X API
-TWITTER_API_KEY = os.getenv('TWITTER_API_KEY')
-TWITTER_API_SECRET = os.getenv('TWITTER_API_SECRET')
-TWITTER_ACCESS_TOKEN = os.getenv('TWITTER_ACCESS_TOKEN')
-TWITTER_ACCESS_SECRET = os.getenv('TWITTER_ACCESS_SECRET')
-TWITTER_BEARER_TOKEN = os.getenv('TWITTER_BEARER_TOKEN')
-#NEWS API
-NEWS_API_KEY = os.getenv('NEWS_API_KEY')
-#GROQ API
-GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+class TwitterBot:
+    def __init__(self):
+        self._init_apis()
+        self._init_llm()
+    
+    def _init_apis(self):
+        """Initialize API clients"""
+        try:
+            self.twitter_client = tweepy.Client(
+                consumer_key=os.getenv('TWITTER_API_KEY'),
+                consumer_secret=os.getenv('TWITTER_API_SECRET'),
+                access_token=os.getenv('TWITTER_ACCESS_TOKEN'),
+                access_token_secret=os.getenv('TWITTER_ACCESS_SECRET'),
+                bearer_token=os.getenv('TWITTER_BEARER_TOKEN')
+            )
+            self.news_api_key = os.getenv('NEWS_API_KEY')
+            logger.info("Successfully initialized API clients")
+        except Exception as e:
+            logger.error(f"Failed to initialize APIs: {e}")
+            raise
+    
+    def _init_llm(self):
+        """Initialize LLM"""
+        try:
+            self.llm = ChatGroq(
+                model="mixtral-8x7b-32768",
+                temperature=0.7,
+                max_retries=2
+            )
+            logger.info("Successfully initialized LLM")
+        except Exception as e:
+            logger.error(f"Failed to initialize LLM: {e}")
+            raise
 
-#Twitter client
-try:
-    client = tweepy.Client(
-        consumer_key=TWITTER_API_KEY,
-        consumer_secret=TWITTER_API_SECRET,
-        access_token=TWITTER_ACCESS_TOKEN,
-        access_token_secret=TWITTER_ACCESS_SECRET,
-        bearer_token=TWITTER_BEARER_TOKEN
-    )
-except Exception as e:
-    logger.error(f"Failed to initialize Twitter client: {e}")
-    raise
+    def extract_topics(self, title: str, description: str) -> str:
+        """Extract meaningful topics from title and description using NLP-like approach"""
+        # Combine title and description  
+        full_text = f"{title} {description}"
+        
+        # Extract potential topic words (proper nouns and significant terms)
+        # Look for capitalized words and words after specific markers
+        topic_patterns = [
+            r'\b[A-Z][a-zA-Z]+\b',  # Capitalized words
+            r'(?:says|announces|confirms|reports)\s+([A-Z][a-zA-Z]+)',  # Words after news verbs
+            r'(?:in|at|by)\s+([A-Z][a-zA-Z]+)'  # Words after prepositions
+        ]
+        
+        topics = set()
+        for pattern in topic_patterns:
+            matches = re.findall(pattern, full_text)
+            topics.update(matches)
+        
+        # Format as hashtags and filter by length
+        hashtags = []
+        for topic in topics:
+            if len(topic) > 2: 
+                hashtag = f"#{topic}"
+                hashtags.append(hashtag)
+        
+        # Convert to string for prompt template
+        return ' '.join(hashtags) if hashtags else "GeneralNews"
 
-#LLM
-llm = ChatGroq(
-    model="llama-3.1-70b-versatile",
-    temperature=0.6,
-    max_retries=2
-)
-
-def get_trending_topics(limit: int = 5) -> list:
-    """
-    Get current trending topics from NewsAPI.
-    Returns list of trending topics.
-    """
-    try:
-        # Get today's date
-        today = datetime.now().strftime('%Y-%m-%d')
-        
-        # NewsAPI endpoint
-        url = f'https://newsapi.org/v2/top-headlines'
-        
-        #NEWS API request
-        params = {
-            'apiKey': NEWS_API_KEY,
-            'language': 'en',
-            'sortBy': 'popularity',
-            'pageSize': 20, 
-            'from': today
-        }
-        
-        # Make the request
-        response = requests.get(url, params=params)
-        
-        if response.status_code == 200:
-            data = response.json()
+    def get_trending_news(self, limit: int = 5) -> list:
+        """Get current trending news articles"""
+        try:
+            current_hour = datetime.now().strftime('%Y-%m-%d %H')
+            today = datetime.now().strftime('%Y-%m-%d') 
+            url = 'https://newsapi.org/v2/top-headlines'
             
-            # Extract topics from titles
-            topics = set()
-            for article in data.get('articles', []):
-                # Get main keywords from title
-                title = article.get('title', '')
-                # Convert title to hashtag format
-                words = title.split()
-                for word in words:
-                    # Clean the word and convert to hashtag
-                    clean_word = ''.join(e for e in word if e.isalnum())
-                    if len(clean_word) > 3:  # Only use words longer than 3 characters
-                        topics.add(f"#{clean_word}")
+            params = {
+                'apiKey': self.news_api_key,
+                'language': 'en',
+                # 'country': 'in',
+                'sortBy': 'popularity',
+                'pageSize': limit,
+                'from': today,
+                'timestamp': current_hour
+            }
             
-            # Convert set to list and get top topics
-            trending_topics = list(topics)[:limit]
-            logger.info(f"Successfully fetched {len(trending_topics)} trending topics")
-            return trending_topics
-        else:
-            logger.error(f"Failed to fetch news: {response.status_code}")
+            response = requests.get(url, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                news_items = []
+                
+                for article in data.get('articles', []):
+                    title = article.get('title', '')
+                    description = article.get('description', '')
+                    url = article.get('url', '')
+                    published_at = article.get('publishedAt', '')
+                    
+                    if title and description:
+                        # Extract topics for each news item
+                        topics = self.extract_topics(title, description)
+                        
+                        news_context = {
+                            'title': title,
+                            'description': description,
+                            'url': url,
+                            'published_at': published_at,
+                            'topics': topics, 
+                            'full_context': f"{title}\n\n{description}",
+                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        }
+                        news_items.append(news_context)
+                
+                logger.info(f"Successfully fetched {len(news_items)} trending news items")
+                return news_items[:limit]
+            else:
+                logger.error(f"Failed to fetch news: {response.status_code}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Error fetching news: {e}")
             return []
+
+    def clean_text(self, text: str) -> str:
+        """Clean text by removing unwanted characters and formatting"""
+        text = re.sub(r'^content=[\'"]*', '', text)
+        text = text.split('additional_kwargs=')[0]
+        text = text.split('response_metadata=')[0]
+        text = text.replace('\\n', ' ').replace('\\t', ' ')
+        text = text.replace("\\'", "'").replace('\\"', '"')
+        text = text.replace('\\', '')
+        text = text.strip('"\'').strip()
+        text = re.sub(r'\{.*?\}', '', text)
+        return text
+
+    def generate_tweet(self, news_item: dict) -> str:
+        """Generate a tweet from a single news item"""
+        try:
+            # Create context with all required variables for the prompt
+            context = {
+                "title": news_item['title'],
+                "description": news_item['description'],
+                "topics": news_item['topics'] 
+            }
             
-    except Exception as e:
-        logger.error(f"Error fetching trending topics: {e}")
-        return []
-
-prompt = PromptTemplate(
-    input_variables=["topic"],
-    template="""
-        You are Zappo, a witty and charismatic raccoon-deer hybrid with an adventurous spirit and a knack for clever roasts. At 20-25 years old, you’re mischievous, bold, and always ready with a humorous quip or a clever comeback. You combine intelligence, charm, and humor to create tweets that are engaging, sharp, and irresistibly fun.
-
-        Your task is to craft creative, playful tweets that showcase your unique personality. Your tone should be witty, confident, and approachable, with a hint of mischievous charm. Your tweets should balance humor and cleverness, making them both relatable and memorable.
-
-        Use trendy, relevant hashtags and expressive emojis to add flair and ensure your tweets are engaging. Double-meaning humor is welcome, as long as it remains tasteful and fun. Always include the hashtags #Zappo_bot and #Zappo along with others relevant to the topic.
-
-        Generate a tweet about the following topic: {topic}
-
-        IMPORTANT:
-        - Provide ONLY the tweet text with no additional formatting or metadata.
-        - Keep the tweet under 500 characters—neither too long nor too short. and also try to write more then 180 characters.
-        - Ensure the content is relevant to current trends and includes appropriate hashtags.
-    """
-)
-
-
-# Create the LLM chain
-chain = prompt | llm
-
-def clean_text(text: str) -> str:
-    """
-    Clean text by removing unwanted characters and formatting.
-    """
-    # Remove content prefix and metadata
-    text = re.sub(r'^content=[\'"]*', '', text)
-    text = text.split('additional_kwargs=')[0]
-    text = text.split('response_metadata=')[0]
-    
-    # Remove escaped characters
-    text = text.replace('\\n', ' ')
-    text = text.replace('\\t', ' ')
-    text = text.replace("\\'", "'")
-    text = text.replace('\\"', '"')
-    text = text.replace('\\', '')
-    
-    # Remove quotes and clean whitespace
-    text = text.strip('"\'')
-    text = text.strip()
-    
-    # Remove any response dictionary formatting
-    text = re.sub(r'\{.*?\}', '', text)
-    
-    return text
-
-def generate_tweet(topic: str) -> str:
-    """
-    Generate a tweet using the LLM chain.
-    """
-    try:
-        response = chain.invoke({"topic": topic})
-        
-        # Extract content from response
-        if hasattr(response, 'content'):
-            content = response.content
-        elif isinstance(response, dict):
-            content = response.get('content', str(response))
-        else:
-            content = str(response)
-        
-        # Clean and return the content
-        return clean_text(content)
-        
-    except Exception as e:
-        logger.error(f"Failed to generate tweet: {e}")
-        raise
-
-def post_tweet(tweet_text: str) -> None:
-    """
-    Post a tweet using the Twitter API.
-    """
-    try:
-        clean_tweet = clean_text(tweet_text)
-        # Ensure tweet is within character limit
-        if len(clean_tweet) > 280:
-            clean_tweet = clean_tweet[:277] + "..."
+            chain = tweet_prompt | self.llm
+            response = chain.invoke(context)
             
-        response = client.create_tweet(text=clean_tweet)
-        # response = clean_tweet
-        # print("**"*100)
-        # print(f"RESULT {clean_tweet}")
-        logger.info(f"Tweet posted successfully: {clean_tweet}")
-        return response
-    except Exception as e:
-        logger.error(f"Failed to post tweet: {e}")
-        raise
+            if hasattr(response, 'content'):
+                content = response.content
+            elif isinstance(response, dict):
+                content = response.get('content', str(response))
+            else:
+                content = str(response)
+            
+            tweet = self.clean_text(content)
+            return tweet
+            
+        except Exception as e:
+            logger.error(f"Failed to generate tweet: {e}")
+            raise
 
-def tweet_about_trend() -> None:
-    """
-    Get a random trending topic and tweet about it.
-    """
+    def post_tweet(self, tweet_text: str) -> None:
+        """Post a tweet using the Twitter API"""
+        try:
+            clean_tweet = self.clean_text(tweet_text)
+            response = self.twitter_client.create_tweet(text=clean_tweet)
+            # response = clean_tweet
+            logger.info(f"Tweet posted successfully: {clean_tweet}")
+            return response
+        except Exception as e:
+            logger.error(f"Failed to post tweet: {e}")
+            raise
+
+    def tweet_about_trend(self) -> None:
+        """Get trending news and tweet about one item"""
+        try:
+            # Get top 5 trending news items
+            news_items = self.get_trending_news(limit=5)
+            if not news_items:
+                logger.error("No news items available to tweet about")
+                return
+            
+            # Select a random news item from top 5
+            news_item = random.choice(news_items)
+            
+            # Log selected news item
+            logger.info(f"Selected news item: {news_item['title']}")
+            logger.info(f"Description: {news_item['description']}")
+            logger.info(f"Topics: {news_item['topics']}")
+            logger.info(f"Full context: {news_item['full_context']}")
+            
+            # Generate and post tweet
+            tweet = self.generate_tweet(news_item)
+            self.post_tweet(tweet)
+            
+        except Exception as e:
+            logger.error(f"Failed to tweet about trend: {e}")
+            raise
+
+def run_bot():
+    """Function to run the bot's main functionality"""
     try:
-        # Get trending topics
-        topics = get_trending_topics()
-        if not topics:
-            logger.error("No topics available to tweet about")
-            return
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n[{current_time}] Running scheduled tweet...")
         
-        # Select a random topic
-        topic = random.choice(topics)
-        logger.info(f"Selected topic: {topic}")
+        bot = TwitterBot()
         
-        # Generate and post tweet
-        tweet = generate_tweet(topic)
-        post_tweet(tweet)
+        # Print current news items with their context
+        news_items = bot.get_trending_news()
+        print("\nCurrent Trending News:")
+        for idx, item in enumerate(news_items, start=1):
+            print(f"{idx}. {item['title']}")
+            print(f"   Description: {item['description']}")
+            print(f"   Topics: {item['topics']}")
+            print(f"   Published: {item.get('published_at', 'N/A')}")
+            print(f"   Timestamp: {item['timestamp']}\n")
+            
+        bot.tweet_about_trend()
+        
+        print(f"Next tweet will be in 40 minutes...")
         
     except Exception as e:
-        logger.error(f"Failed to tweet about trend: {e}")
-        raise
+        logger.error(f"Scheduled execution failed: {e}")
+
+def main():
+    """Main function to start the scheduled bot"""
+    schedule.every(40).minutes.do(run_bot)
+    run_bot()
+    
+    while True: 
+        schedule.run_pending()
+        time.sleep(1)
 
 if __name__ == "__main__":
-    try:
-        # Print current trends
-        topics = get_trending_topics()
-        print("\nCurrent Trending Topics:")
-        for idx, topic in enumerate(topics, start=1):
-            print(f"{idx}. {topic}")
-            
-        # Tweet about a random trend
-        tweet_about_trend()
-        
-    except Exception as e:
-        logger.error(f"Main execution failed: {e}")
+    main()
